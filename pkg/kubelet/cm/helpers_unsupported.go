@@ -22,28 +22,76 @@ package cm
 import (
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	kubefeatures "k8s.io/kubernetes/pkg/features"
 )
 
 const (
-	MinShares = 0
-	MaxShares = 0
+	// These limits are defined in the kernel:
+	// https://github.com/torvalds/linux/blob/0bddd227f3dc55975e2b8dfa7fc6f959b062a2c7/kernel/sched/sched.h#L427-L428
+	MinShares = 2
+	MaxShares = 262144
 
-	SharesPerCPU  = 0
-	MilliCPUToCPU = 0
+	SharesPerCPU  = 1024
+	MilliCPUToCPU = 1000
 
-	QuotaPeriod      = 0
-	MinQuotaPeriod   = 0
-	MinMilliCPULimit = 0
+	// 100000 microseconds is equivalent to 100ms
+	QuotaPeriod = 100000
+	// 1000 microseconds is equivalent to 1ms
+	// defined here:
+	// https://github.com/torvalds/linux/blob/cac03ac368fabff0122853de2422d4e17a32de08/kernel/sched/core.c#L10546
+	MinQuotaPeriod = 1000
+
+	// From the inverse of the conversion in MilliCPUToQuota:
+	// MinQuotaPeriod * MilliCPUToCPU / QuotaPeriod
+	MinMilliCPULimit = 10
 )
 
-// MilliCPUToQuota converts milliCPU and period to CFS quota values.
-func MilliCPUToQuota(milliCPU, period int64) int64 {
-	return 0
+// MilliCPUToQuota converts milliCPU to CFS quota and period values.
+// Input parameters and resulting value is number of microseconds.
+func MilliCPUToQuota(milliCPU int64, period int64) (quota int64) {
+	// CFS quota is measured in two values:
+	//  - cfs_period_us=100ms (the amount of time to measure usage across given by period)
+	//  - cfs_quota=20ms (the amount of cpu time allowed to be used across a period)
+	// so in the above example, you are limited to 20% of a single CPU
+	// for multi-cpu environments, you just scale equivalent amounts
+	// see https://www.kernel.org/doc/Documentation/scheduler/sched-bwc.txt for details
+
+	if milliCPU == 0 {
+		return
+	}
+
+	if !utilfeature.DefaultFeatureGate.Enabled(kubefeatures.CPUCFSQuotaPeriod) {
+		period = QuotaPeriod
+	}
+
+	// we then convert your milliCPU to a value normalized over a period
+	quota = (milliCPU * period) / MilliCPUToCPU
+
+	// quota needs to be a minimum of 1ms.
+	if quota < MinQuotaPeriod {
+		quota = MinQuotaPeriod
+	}
+	return
 }
 
 // MilliCPUToShares converts the milliCPU to CFS shares.
 func MilliCPUToShares(milliCPU int64) uint64 {
-	return 0
+	if milliCPU == 0 {
+		// Docker converts zero milliCPU to unset, which maps to kernel default
+		// for unset: 1024. Return 2 here to really match kernel default for
+		// zero milliCPU.
+		return MinShares
+	}
+	// Conceptually (milliCPU / milliCPUToCPU) * sharesPerCPU, but factored to improve rounding.
+	shares := (milliCPU * SharesPerCPU) / MilliCPUToCPU
+	if shares < MinShares {
+		return MinShares
+	}
+	if shares > MaxShares {
+		return MaxShares
+	}
+	return uint64(shares)
 }
 
 // ResourceConfigForPod takes the input pod and outputs the cgroup resource config.

@@ -25,16 +25,3 @@ type SchedulerMetrics testutil.Metrics
 func (m *SchedulerMetrics) Equal(o SchedulerMetrics) bool {
 	return (*testutil.Metrics)(m).Equal(testutil.Metrics(o))
 }
-
-func newSchedulerMetrics() SchedulerMetrics {
-	result := testutil.NewMetrics()
-	return SchedulerMetrics(result)
-}
-
-func parseSchedulerMetrics(data string) (SchedulerMetrics, error) {
-	result := newSchedulerMetrics()
-	if err := testutil.ParseMetrics(data, (*testutil.Metrics)(&result)); err != nil {
-		return SchedulerMetrics{}, err
-	}
-	return result, nil
-}

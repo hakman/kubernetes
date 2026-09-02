@@ -22,7 +22,9 @@ import (
 	"fmt"
 	"net"
 	"regexp"
+	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -33,6 +35,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/wait"
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
+	"k8s.io/component-base/metrics/testutil"
 	"k8s.io/klog/v2"
 	"k8s.io/kubernetes/test/e2e/framework"
 	e2epod "k8s.io/kubernetes/test/e2e/framework/pod"
@@ -48,6 +51,17 @@ const (
 	snapshotControllerPort = 9102
 	// kubeProxyPort is the default port for the kube-proxy status server.
 	kubeProxyPort = 10249
+
+	// kubeSchedulerLease is the name of the Lease in kube-system that
+	// kube-scheduler uses for leader election.
+	kubeSchedulerLease = "kube-scheduler"
+	// kubeControllerManagerLease is the name of the Lease in kube-system that
+	// kube-controller-manager uses for leader election.
+	kubeControllerManagerLease = "kube-controller-manager"
+
+	// leaderElectionStatusMetric is exported by every component that takes part
+	// in leader election. It is 1 on the leader and 0 on the standbys.
+	leaderElectionStatusMetric = "leader_election_master_status"
 )
 
 // MetricsGrabbingDisabledError is an error that is wrapped by the
@@ -67,6 +81,14 @@ type Collection struct {
 	ClusterAutoscalerMetrics  ClusterAutoscalerMetrics
 }
 
+// controlPlanePod is one replica of a control plane component. The node name is
+// kept next to the pod name because leader election identifies the leader by
+// hostname, not by pod name.
+type controlPlanePod struct {
+	name     string
+	nodeName string
+}
+
 // Grabber provides functions which grab metrics from components
 type Grabber struct {
 	client                             clientset.Interface
@@ -78,9 +100,9 @@ type Grabber struct {
 	grabFromScheduler                  bool
 	grabFromClusterAutoscaler          bool
 	grabFromSnapshotController         bool
-	kubeScheduler                      string
+	kubeSchedulers                     []controlPlanePod
 	waitForSchedulerReadyOnce          sync.Once
-	kubeControllerManager              string
+	kubeControllerManagers             []controlPlanePod
 	waitForControllerManagerReadyOnce  sync.Once
 	snapshotController                 string
 	waitForSnapshotControllerReadyOnce sync.Once
@@ -95,8 +117,8 @@ type Grabber struct {
 // support it. If disabled for a component, the corresponding Grab function
 // will immediately return an error derived from MetricsGrabbingDisabledError.
 func NewMetricsGrabber(ctx context.Context, c clientset.Interface, ec clientset.Interface, config *rest.Config, kubelets bool, scheduler bool, controllers bool, apiServer bool, clusterAutoscaler bool, snapshotController bool) (*Grabber, error) {
-	kubeScheduler := ""
-	kubeControllerManager := ""
+	var kubeSchedulers []controlPlanePod
+	var kubeControllerManagers []controlPlanePod
 	snapshotControllerManager := ""
 
 	regKubeScheduler := regexp.MustCompile("kube-scheduler-.*")
@@ -114,18 +136,19 @@ func NewMetricsGrabber(ctx context.Context, c clientset.Interface, ec clientset.
 	if len(podList.Items) < 1 {
 		klog.Warningf("Can't find any pods in namespace %s to grab metrics from", metav1.NamespaceSystem)
 	}
+	// kube-scheduler and kube-controller-manager are leader elected, so a cluster
+	// with more than one control plane node runs several replicas of them. Keep
+	// all of them: which replica is worth scraping depends on who holds the lease
+	// and is only decided when metrics are grabbed.
 	for _, pod := range podList.Items {
 		if regKubeScheduler.MatchString(pod.Name) {
-			kubeScheduler = pod.Name
+			kubeSchedulers = append(kubeSchedulers, controlPlanePod{name: pod.Name, nodeName: pod.Spec.NodeName})
 		}
 		if regKubeControllerManager.MatchString(pod.Name) {
-			kubeControllerManager = pod.Name
+			kubeControllerManagers = append(kubeControllerManagers, controlPlanePod{name: pod.Name, nodeName: pod.Spec.NodeName})
 		}
 		if regSnapshotController.MatchString(pod.Name) {
 			snapshotControllerManager = pod.Name
-		}
-		if kubeScheduler != "" && kubeControllerManager != "" && snapshotControllerManager != "" {
-			break
 		}
 	}
 	if clusterAutoscaler && ec == nil {
@@ -137,15 +160,22 @@ func NewMetricsGrabber(ctx context.Context, c clientset.Interface, ec clientset.
 		externalClient:             ec,
 		config:                     config,
 		grabFromAPIServer:          apiServer,
-		grabFromControllerManager:  checkPodDebugHandlers(ctx, c, controllers, "kube-controller-manager", kubeControllerManager),
+		grabFromControllerManager:  checkPodDebugHandlers(ctx, c, controllers, "kube-controller-manager", firstPodName(kubeControllerManagers)),
 		grabFromKubelets:           kubelets,
-		grabFromScheduler:          checkPodDebugHandlers(ctx, c, scheduler, "kube-scheduler", kubeScheduler),
+		grabFromScheduler:          checkPodDebugHandlers(ctx, c, scheduler, "kube-scheduler", firstPodName(kubeSchedulers)),
 		grabFromClusterAutoscaler:  clusterAutoscaler,
 		grabFromSnapshotController: checkPodDebugHandlers(ctx, c, snapshotController, "snapshot-controller", snapshotControllerManager),
-		kubeScheduler:              kubeScheduler,
-		kubeControllerManager:      kubeControllerManager,
+		kubeSchedulers:             kubeSchedulers,
+		kubeControllerManagers:     kubeControllerManagers,
 		snapshotController:         snapshotControllerManager,
 	}, nil
+}
+
+func firstPodName(pods []controlPlanePod) string {
+	if len(pods) == 0 {
+		return ""
+	}
+	return pods[0].name
 }
 
 func checkPodDebugHandlers(ctx context.Context, c clientset.Interface, requested bool, component, podName string) bool {
@@ -172,7 +202,88 @@ func checkPodDebugHandlers(ctx context.Context, c clientset.Interface, requested
 
 // HasControlPlanePods returns true if metrics grabber was able to find control-plane pods
 func (g *Grabber) HasControlPlanePods() bool {
-	return g.kubeScheduler != "" && g.kubeControllerManager != ""
+	return len(g.kubeSchedulers) > 0 && len(g.kubeControllerManagers) > 0
+}
+
+// leaderFirst returns the replicas of a leader elected component, reordered so
+// that the holder of the named Lease in kube-system comes first.
+//
+// Leader election records the holder as "<hostname>_<uuid>", where the hostname
+// is whatever os.Hostname() returned inside the component. Control plane
+// components run as host network pods, so that is the hostname of the node they
+// run on - but a node is not always named after its hostname. kOps on
+// DigitalOcean, for example, names nodes after the droplet's private IP while
+// the hostname is the droplet name. The match is therefore best effort: it only
+// decides the order in which replicas are tried, and grabFromLeader confirms
+// leadership from the metrics it scrapes.
+func leaderFirst(ctx context.Context, c clientset.Interface, leaseName string, pods []controlPlanePod) []controlPlanePod {
+	lease, err := c.CoordinationV1().Leases(metav1.NamespaceSystem).Get(ctx, leaseName, metav1.GetOptions{})
+	if err != nil || lease.Spec.HolderIdentity == nil || *lease.Spec.HolderIdentity == "" {
+		return pods
+	}
+	// Drop the uniquifier that leader election appends to the hostname.
+	holder := *lease.Spec.HolderIdentity
+	if i := strings.LastIndex(holder, "_"); i > 0 {
+		holder = holder[:i]
+	}
+	for i, pod := range pods {
+		if sameHost(pod.nodeName, holder) {
+			ordered := slices.Clone(pods)
+			ordered[0], ordered[i] = ordered[i], ordered[0]
+			return ordered
+		}
+	}
+	return pods
+}
+
+// sameHost reports whether a node name and a hostname refer to the same machine.
+// Either of them may be fully qualified while the other is not.
+func sameHost(nodeName, hostname string) bool {
+	nodeName, hostname = strings.ToLower(nodeName), strings.ToLower(hostname)
+	return nodeName == hostname ||
+		strings.HasPrefix(nodeName, hostname+".") ||
+		strings.HasPrefix(hostname, nodeName+".")
+}
+
+// grabFromLeader scrapes the replicas of a leader elected component and returns
+// the metrics of the one that holds the named Lease. Only the leader runs the
+// controllers behind those metrics, so on a cluster with several control plane
+// nodes the other replicas have nothing to report.
+func (g *Grabber) grabFromLeader(ctx context.Context, leaseName string, pods []controlPlanePod, port int) (testutil.Metrics, error) {
+	var errs []error
+	for _, pod := range pods {
+		output, err := g.getSecureMetricsFromPod(ctx, pod.name, metav1.NamespaceSystem, port)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", pod.name, err))
+			continue
+		}
+		metrics := testutil.NewMetrics()
+		if err := testutil.ParseMetrics(output, &metrics); err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", pod.name, err))
+			continue
+		}
+		// A component running without leader election does not export the metric
+		// at all, and then every replica is equally good.
+		if held, exported := holdsLease(metrics, leaseName); held || !exported {
+			return metrics, nil
+		}
+	}
+	err := fmt.Errorf("none of the %d replicas holds the %q lease", len(pods), leaseName)
+	if len(errs) > 0 {
+		err = fmt.Errorf("%w: %w", err, errors.Join(errs...))
+	}
+	return nil, err
+}
+
+// holdsLease reports what a scraped component says about the named Lease:
+// whether it holds it, and whether it reports on it at all.
+func holdsLease(metrics testutil.Metrics, leaseName string) (held, exported bool) {
+	for _, sample := range metrics[leaderElectionStatusMetric] {
+		if string(sample.Metric["name"]) == leaseName {
+			return sample.Value == 1, true
+		}
+	}
+	return false, false
 }
 
 // GrabFromKubelet returns metrics from kubelet
@@ -283,10 +394,12 @@ func (g *Grabber) GrabFromScheduler(ctx context.Context) (SchedulerMetrics, erro
 		return SchedulerMetrics{}, fmt.Errorf("kube-scheduler: %w", MetricsGrabbingDisabledError)
 	}
 
+	pods := leaderFirst(ctx, g.client, kubeSchedulerLease, g.kubeSchedulers)
+
 	var err error
 
 	g.waitForSchedulerReadyOnce.Do(func() {
-		if readyErr := e2epod.WaitTimeoutForPodReadyInNamespace(ctx, g.client, g.kubeScheduler, metav1.NamespaceSystem, 5*time.Minute); readyErr != nil {
+		if readyErr := e2epod.WaitTimeoutForPodReadyInNamespace(ctx, g.client, pods[0].name, metav1.NamespaceSystem, 5*time.Minute); readyErr != nil {
 			err = fmt.Errorf("error waiting for kube-scheduler pod to be ready: %w", readyErr)
 		}
 	})
@@ -295,16 +408,16 @@ func (g *Grabber) GrabFromScheduler(ctx context.Context) (SchedulerMetrics, erro
 	}
 
 	var lastMetricsFetchErr error
-	var output string
+	var metrics testutil.Metrics
 	if metricsWaitErr := wait.PollUntilContextTimeout(ctx, time.Second, time.Minute, true, func(ctx context.Context) (bool, error) {
-		output, lastMetricsFetchErr = g.getSecureMetricsFromPod(ctx, g.kubeScheduler, metav1.NamespaceSystem, kubeSchedulerPort)
+		metrics, lastMetricsFetchErr = g.grabFromLeader(ctx, kubeSchedulerLease, pods, kubeSchedulerPort)
 		return lastMetricsFetchErr == nil, nil
 	}); metricsWaitErr != nil {
 		err := fmt.Errorf("error waiting for kube-scheduler pod to expose metrics: %v; %v", metricsWaitErr, lastMetricsFetchErr)
 		return SchedulerMetrics{}, err
 	}
 
-	return parseSchedulerMetrics(output)
+	return SchedulerMetrics(metrics), nil
 }
 
 // GrabFromClusterAutoscaler returns metrics from cluster autoscaler
@@ -334,10 +447,12 @@ func (g *Grabber) GrabFromControllerManager(ctx context.Context) (ControllerMana
 		return ControllerManagerMetrics{}, fmt.Errorf("kube-controller-manager: %w", MetricsGrabbingDisabledError)
 	}
 
+	pods := leaderFirst(ctx, g.client, kubeControllerManagerLease, g.kubeControllerManagers)
+
 	var err error
 
 	g.waitForControllerManagerReadyOnce.Do(func() {
-		if readyErr := e2epod.WaitTimeoutForPodReadyInNamespace(ctx, g.client, g.kubeControllerManager, metav1.NamespaceSystem, 5*time.Minute); readyErr != nil {
+		if readyErr := e2epod.WaitTimeoutForPodReadyInNamespace(ctx, g.client, pods[0].name, metav1.NamespaceSystem, 5*time.Minute); readyErr != nil {
 			err = fmt.Errorf("error waiting for kube-controller-manager pod to be ready: %w", readyErr)
 		}
 	})
@@ -345,17 +460,17 @@ func (g *Grabber) GrabFromControllerManager(ctx context.Context) (ControllerMana
 		return ControllerManagerMetrics{}, err
 	}
 
-	var output string
+	var metrics testutil.Metrics
 	var lastMetricsFetchErr error
 	if metricsWaitErr := wait.PollUntilContextTimeout(ctx, time.Second, time.Minute, true, func(ctx context.Context) (bool, error) {
-		output, lastMetricsFetchErr = g.getSecureMetricsFromPod(ctx, g.kubeControllerManager, metav1.NamespaceSystem, kubeControllerManagerPort)
+		metrics, lastMetricsFetchErr = g.grabFromLeader(ctx, kubeControllerManagerLease, pods, kubeControllerManagerPort)
 		return lastMetricsFetchErr == nil, nil
 	}); metricsWaitErr != nil {
 		err := fmt.Errorf("error waiting for kube-controller-manager to expose metrics: %v; %v", metricsWaitErr, lastMetricsFetchErr)
 		return ControllerManagerMetrics{}, err
 	}
 
-	return parseControllerManagerMetrics(output)
+	return ControllerManagerMetrics(metrics), nil
 }
 
 // GrabFromSnapshotController returns metrics from controller manager

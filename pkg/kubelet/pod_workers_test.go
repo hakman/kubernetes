@@ -460,6 +460,7 @@ func createPodWorkersWithLogger(logger klog.Logger) (*podWorkers, *containertest
 		time.Second,
 		time.Millisecond,
 		fakeCache,
+		func(klog.Logger, types.UID) {},
 		allocation.NewInMemoryManager(logger, nil, nil, nil, nil, nil, nil),
 	)
 	workers := w.(*podWorkers)
@@ -1142,6 +1143,106 @@ func TestUpdatePodForTerminatedRuntimePod(t *testing.T) {
 	updates := processed["1"]
 	if len(updates) != 0 {
 		t.Fatalf("unexpected updates: %v", updates)
+	}
+}
+
+// relistRecord is a relist request, or a cache wait for a status newer than minTime.
+type relistRecord struct {
+	relist  bool
+	minTime time.Time
+}
+
+// relistRecorder wraps the pod cache of the pod workers and records, per pod, their relist
+// requests and cache waits in the order they happen.
+type relistRecorder struct {
+	kubecontainer.ROCache
+	lock    sync.Mutex
+	records map[types.UID][]relistRecord
+}
+
+func (r *relistRecorder) requestPodRelist(_ klog.Logger, podUID types.UID) {
+	r.add(podUID, relistRecord{relist: true})
+}
+
+func (r *relistRecorder) GetNewerThan(ctx context.Context, podUID types.UID, minTime time.Time) (*kubecontainer.PodStatus, error) {
+	r.add(podUID, relistRecord{minTime: minTime})
+	return r.ROCache.GetNewerThan(ctx, podUID, minTime)
+}
+
+func (r *relistRecorder) add(podUID types.UID, record relistRecord) {
+	r.lock.Lock()
+	defer r.lock.Unlock()
+	r.records[podUID] = append(r.records[podUID], record)
+}
+
+func (r *relistRecorder) get(podUID types.UID) []relistRecord {
+	r.lock.Lock()
+	defer r.lock.Unlock()
+	return append([]relistRecord(nil), r.records[podUID]...)
+}
+
+func TestUpdatePodRequestsRelistOnTermination(t *testing.T) {
+	logger, tCtx := ktesting.NewTestContext(t)
+	podWorkers, _, processed := createPodWorkers(logger)
+	recorder := &relistRecorder{ROCache: podWorkers.podCache, records: map[types.UID][]relistRecord{}}
+	podWorkers.podCache = recorder
+	podWorkers.requestPodRelist = recorder.requestPodRelist
+
+	// The fake clock does not advance, so every sync ends at this time.
+	lastSyncTime := podWorkers.clock.Now()
+	relist := relistRecord{relist: true}
+	waitNewerThan := func(minTime time.Time) relistRecord { return relistRecord{minTime: minTime} }
+
+	tests := []struct {
+		name    string
+		updates []UpdatePodOptions
+		want    []relistRecord
+	}{
+		{
+			name: "sync waits without a request, termination transitions request before they wait",
+			updates: []UpdatePodOptions{
+				{UpdateType: kubetypes.SyncPodCreate, Pod: newNamedPod("1", "ns", "running", false)},
+				{UpdateType: kubetypes.SyncPodKill, Pod: newNamedPod("1", "ns", "running", false)},
+			},
+			want: []relistRecord{
+				waitNewerThan(time.Time{}),          // sync
+				relist, waitNewerThan(lastSyncTime), // terminating
+				relist, waitNewerThan(lastSyncTime), // terminated
+			},
+		},
+		{
+			name: "termination before the first sync requests no relist until terminated",
+			updates: []UpdatePodOptions{
+				{UpdateType: kubetypes.SyncPodKill, Pod: newNamedPod("2", "ns", "killed", false)},
+			},
+			want: []relistRecord{
+				waitNewerThan(time.Time{}),          // terminating
+				relist, waitNewerThan(lastSyncTime), // terminated
+			},
+		},
+		{
+			name: "runtime pod termination neither waits nor requests",
+			updates: []UpdatePodOptions{
+				{UpdateType: kubetypes.SyncPodKill, RunningPod: &kubecontainer.Pod{ID: "3", Name: "orphan", Namespace: "ns"}},
+			},
+			want: nil,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var uid types.UID
+			for _, update := range tc.updates {
+				uid, _ = podUIDAndRefForUpdate(update)
+				podWorkers.UpdatePod(tCtx, update)
+				drainAllWorkers(podWorkers)
+			}
+			if len(processed[uid]) == 0 {
+				t.Fatalf("pod %s was not processed", uid)
+			}
+			if diff := cmp.Diff(tc.want, recorder.get(uid), cmp.AllowUnexported(relistRecord{})); diff != "" {
+				t.Errorf("unexpected relist requests and cache waits (-want +got):\n%s", diff)
+			}
+		})
 	}
 }
 
@@ -2169,6 +2270,7 @@ func TestFakePodWorkers(t *testing.T) {
 		time.Second,
 		time.Second,
 		fakeCache,
+		func(klog.Logger, types.UID) {},
 		allocation.NewInMemoryManager(logger, nil, nil, nil, nil, nil, nil),
 	)
 	fakePodWorkers := &fakePodWorkers{

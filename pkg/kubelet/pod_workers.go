@@ -614,6 +614,9 @@ type podWorkers struct {
 	// podCache stores kubecontainer.PodStatus for all pods.
 	podCache kubecontainer.ROCache
 
+	// requestPodRelist queues an on-demand PLEG relist of a pod, which refreshes its podCache entry.
+	requestPodRelist func(logger klog.Logger, podUID types.UID)
+
 	// allocationManager is used to allocate resources for pods
 	allocationManager allocation.Manager
 
@@ -627,6 +630,7 @@ func newPodWorkers(
 	workQueue queue.WorkQueue,
 	resyncInterval, backOffPeriod time.Duration,
 	podCache kubecontainer.ROCache,
+	requestPodRelist func(logger klog.Logger, podUID types.UID),
 	allocationManager allocation.Manager,
 ) PodWorkers {
 	return &podWorkers{
@@ -640,6 +644,7 @@ func newPodWorkers(
 		resyncInterval:                     resyncInterval,
 		backOffPeriod:                      backOffPeriod,
 		podCache:                           podCache,
+		requestPodRelist:                   requestPodRelist,
 		allocationManager:                  allocationManager,
 		clock:                              clock.RealClock{},
 	}
@@ -1277,14 +1282,19 @@ func (p *podWorkers) podWorkerLoop(parentCtx context.Context, podUID types.UID, 
 				// when we receive a running pod, we don't need status at all because we are
 				// guaranteed to be terminating and we skip updates to the pod
 			default:
-				// wait until we see the next refresh from the PLEG via the cache (max 2s)
-				// TODO: this adds ~1s of latency on all transitions from sync to terminating
-				//  to terminated, and on all termination retries (including evictions). We should
-				//  improve latency by making the pleg continuous and by allowing pod status
-				//  changes to be refreshed when key events happen (killPod, sync->terminating).
-				//  Improving this latency also reduces the possibility that a terminated
-				//  container's status is garbage collected before we have a chance to update the
-				//  API server (thus losing the exit code).
+				// Wait until the PLEG has refreshed the pod's cache entry after the last sync.
+				// SyncPod requests an on-demand relist when it performs runtime operations.
+				// Nothing does for the transitions to terminating and terminated or for
+				// termination retries: the relists that EventedPLEG requests for container stop
+				// events during killPod happen before lastSyncTime. Request one here, so these
+				// waits take one pod inspection instead of up to a global relist period. This
+				// also makes it less likely that a terminated container's status is garbage
+				// collected before it reaches the API server. The global relist still releases
+				// the wait if the request is dropped or the inspection fails. Any relist
+				// satisfies a zero lastSyncTime, so it needs no request.
+				if update.WorkType != SyncPod && !lastSyncTime.IsZero() {
+					p.requestPodRelist(logger, update.Options.Pod.UID)
+				}
 				status, err = p.podCache.GetNewerThan(ctx, update.Options.Pod.UID, lastSyncTime)
 
 				if err != nil {

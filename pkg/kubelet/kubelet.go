@@ -783,6 +783,8 @@ func NewMainKubelet(ctx context.Context,
 		klet.resyncInterval,
 		backOffPeriod,
 		klet.podCache,
+		// klet.pleg is created below; RequestPodRelist reads it when the pod workers call it.
+		klet.RequestPodRelist,
 		klet.allocationManager,
 	)
 

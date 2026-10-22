@@ -982,6 +982,103 @@ func TestWorkerLoop(t *testing.T) {
 	})
 }
 
+func TestRelistPodNotFound(t *testing.T) {
+	featuregatetesting.SetFeatureGateDuringTest(t, feature.DefaultFeatureGate, features.PLEGOnDemandRelist, true)
+	const pod1, pod2 = types.UID("pod1"), types.UID("pod2")
+
+	// setup returns a PLEG whose global relist has seen pod1 with container c1 running.
+	setup := func(tCtx ktesting.TContext) (*GenericPLEG, *containertest.MockRuntime, kubecontainer.Cache) {
+		runtimeMock := containertest.NewMockRuntime(tCtx)
+		cache := kubecontainer.NewCache()
+		pleg := NewGenericPLEG(
+			runtimeMock,
+			make(chan *PodLifecycleEvent, largeChannelCap),
+			&RelistDuration{RelistPeriod: 2 * time.Second},
+			cache,
+			clock.RealClock{},
+		).(*GenericPLEG)
+		pleg.globalRelistTimer = pleg.clock.NewTimer(2 * time.Second)
+
+		runtimeMock.EXPECT().GetPods(mock.Anything, true).Return([]*kubecontainer.Pod{{
+			ID:         pod1,
+			Name:       "pod1",
+			Containers: []*kubecontainer.Container{createTestContainer("c1", kubecontainer.ContainerStateRunning)},
+			Timestamp:  time.Now(),
+		}}, nil).Once()
+		runtimeMock.EXPECT().GetPodStatus(mock.Anything, mock.Anything).Return(&kubecontainer.PodStatus{ID: pod1, TimeStamp: time.Now()}, nil).Once()
+		pleg.Relist(tCtx)
+		require.Equal(tCtx, []*PodLifecycleEvent{{ID: pod1, Type: ContainerStarted, Data: "c1"}}, getEventsFromChannel(pleg.eventChannel))
+
+		// Relist requests made at the time of the global relist are skipped.
+		time.Sleep(time.Second)
+		return pleg, runtimeMock, cache
+	}
+
+	t.Run("known pod removed from the runtime", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			tCtx := ktesting.Init(t)
+			pleg, runtimeMock, cache := setup(tCtx)
+			waiter := getNewerThanAsync(t, cache, pod1, time.Now())
+			requireBlocked(t, waiter)
+
+			runtimeMock.EXPECT().GetPod(mock.Anything, pod1).Return(nil, kubecontainer.ErrPodNotFound).Once()
+			pleg.RequestRelist(tCtx.Logger(), pod1)
+			pleg.workerLoopIteration(tCtx)
+
+			// The waiter gets the same empty status a global relist would give it.
+			assert.Equal(t, &kubecontainer.PodStatus{ID: pod1}, requireUnblocked(t, waiter))
+			status, err := cache.Get(tCtx, pod1)
+			require.NoError(t, err)
+			assert.Equal(t, &kubecontainer.PodStatus{ID: pod1}, status)
+			assert.NotContains(t, pleg.podRecords, pod1)
+			assert.Equal(t, []*PodLifecycleEvent{
+				{ID: pod1, Type: ContainerDied, Data: "c1"},
+				{ID: pod1, Type: ContainerRemoved, Data: "c1"},
+			}, getEventsFromChannel(pleg.eventChannel))
+		})
+	})
+
+	t.Run("unknown pod not in the runtime", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			tCtx := ktesting.Init(t)
+			pleg, runtimeMock, cache := setup(tCtx)
+			waiter := getNewerThanAsync(t, cache, pod2, time.Now())
+			requireBlocked(t, waiter)
+
+			runtimeMock.EXPECT().GetPod(mock.Anything, pod2).Return(nil, kubecontainer.ErrPodNotFound).Once()
+			pleg.RequestRelist(tCtx.Logger(), pod2)
+			pleg.workerLoopIteration(tCtx)
+
+			assert.Equal(t, &kubecontainer.PodStatus{ID: pod2}, requireUnblocked(t, waiter))
+			assert.NotContains(t, pleg.podRecords, pod2)
+			assert.Contains(t, pleg.podRecords, pod1)
+			assert.Empty(t, getEventsFromChannel(pleg.eventChannel))
+		})
+	})
+
+	t.Run("other runtime errors leave the pod to the global relist", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			tCtx := ktesting.Init(t)
+			pleg, runtimeMock, cache := setup(tCtx)
+			waiter := getNewerThanAsync(t, cache, pod1, time.Now())
+			requireBlocked(t, waiter)
+
+			runtimeMock.EXPECT().GetPod(mock.Anything, pod1).Return(nil, errors.New("runtime unavailable")).Once()
+			pleg.RequestRelist(tCtx.Logger(), pod1)
+			pleg.workerLoopIteration(tCtx)
+
+			requireBlocked(t, waiter)
+			assert.Contains(t, pleg.podRecords, pod1)
+			assert.Empty(t, getEventsFromChannel(pleg.eventChannel))
+
+			// The next global relist releases the waiter.
+			time.Sleep(time.Second)
+			cache.UpdateTime(time.Now())
+			requireUnblocked(t, waiter)
+		})
+	})
+}
+
 func getNewerThanAsync(t *testing.T, cache kubecontainer.ROCache, podID types.UID, minTime time.Time) <-chan *kubecontainer.PodStatus {
 	tCtx := ktesting.Init(t)
 	resCh := make(chan *kubecontainer.PodStatus, 1)

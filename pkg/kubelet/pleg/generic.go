@@ -18,6 +18,7 @@ package pleg
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -422,6 +423,19 @@ func (g *GenericPLEG) relistPod(ctx context.Context, podUID types.UID) {
 		metrics.PLEGPodRelistDuration.Observe(metrics.SinceInSeconds(startTime))
 	}()
 	pod, err := g.runtime.GetPod(ctx, podUID)
+	if errors.Is(err, kubecontainer.ErrPodNotFound) {
+		// The runtime has no sandboxes or containers for the pod, as a global relist would find for
+		// a pod missing from its list: report the containers that disappeared and drop the record
+		// and the cache entry. The runtime was queried after startTime, so release status waiters
+		// with that time.
+		logger.V(4).Info("GenericPLEG: Pod not found in the runtime", "podUID", podUID)
+		if pr, ok := g.podRecords[podUID]; ok {
+			pr.current = nil
+			g.reconcilePodRecord(ctx, podUID)
+		}
+		g.cache.SetObservedTime(podUID, startTime)
+		return
+	}
 	if err != nil {
 		// We don't need to do anything other than log the error here, since it will be retried by
 		// the next global relist.
